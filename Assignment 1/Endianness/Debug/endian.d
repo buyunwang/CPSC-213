@@ -1,0 +1,1 @@
+endian.d: ../endian.c
