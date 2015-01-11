@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <assert.h>
+#include "spinlock.h"
 #include "uthread.h"
 #include "uthread_util.h"
 #include "uthread_sem.h"
@@ -60,18 +61,14 @@ void uthread_sem_signal (uthread_sem_t sem) {
  * uthread_sem_wait (aka decrement or P)
  */
 
-static void enqueue_waiter (uthread_t thread, void* semv) {
-  uthread_sem_t sem = semv;
-  uthread_enqueue (&sem->waiter_queue, thread);
-  spinlock_unlock (&sem->spinlock);
-}
-
 void uthread_sem_wait (uthread_sem_t sem) {
   uthread_t waiter_thread;
   
   spinlock_lock (&sem->spinlock);
   while (sem->value < 1) {
-    uthread_block (enqueue_waiter, sem);
+    uthread_enqueue (&sem->waiter_queue, uthread_self());
+    spinlock_unlock (&sem->spinlock);
+    uthread_block();
     spinlock_lock (&sem->spinlock);
   }
   sem->value -= 1;

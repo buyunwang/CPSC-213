@@ -44,6 +44,7 @@
 #if SIG_PROTECTED
 #include <signal.h>
 #endif
+#include "spinlock.h"
 #include "uthread.h"
 #include "uthread_util.h"
 
@@ -90,7 +91,7 @@ void spinlock_lock (spinlock_t* lock) {
   int already_held=1;
   do {
     while (*lock);
-    asm volatile ("xchg  %0, %1\n\t" : "=m" (*lock), "=r" (already_held) : "1" (already_held));
+    asm volatile ("xchg  %0, %1\n" : "=m" (*lock), "=r" (already_held) : "1" (already_held));
   } while (already_held);
 }
 
@@ -242,7 +243,7 @@ static void ready_queue_init () {
 // UTHREAD PRIVATE IMPLEMENTATION
 //
 
-static void uthread_stop    (int, void (*) (uthread_t, void*), void*);
+static void uthread_stop    (int);
 static void uthread_start   (uthread_t);
 static void uthread_free    (uthread_t);
 
@@ -254,7 +255,7 @@ static uthread_t uthread_alloc      ();
 static uthread_t uthread_new_thread (void* (*)(void*), void*);
 
 static uthread_t base_thread;
-static uintptr_t  base_sp_lower_bound, base_sp_upper_bound;
+static uintptr_t base_sp_lower_bound, base_sp_upper_bound;
 
 #if PTHREAD_SETSTACK_SUPPORT==0
 #define MAX_PTHREADS 100
@@ -281,7 +282,7 @@ static void* pthread_base (void* arg) {
 #endif
   while (1) {
 #if PTHREAD_IDLE_SLEEP
-    uthread_stop (TS_BLOCKED, NULL, NULL);
+    uthread_stop (TS_BLOCKED);
 #else
     uthread_yield();
 #endif
@@ -372,45 +373,45 @@ static uthread_t uthread_new_thread (void* (*start_proc)(void*), void* start_arg
 #if __LP64__
 // IA32-64
 #define CLOBBERED_REGISTERS "%rax", "%rcx"
-                "movq  %%rsp, %%rax\n\t"
-                "movq %c1(%0), %%rsp\n\t"
-                "subq $512, %%rsp\n\t"    // frame for uthread_switch
-                "pushq $0\n\t"
-                "pushq $0\n\t"
-                "pushq $0\n\t"
-                "pushq $0\n\t"
-                "pushq $0\n\t"
-                "pushq %%r8\n\t"
-                "pushq %%r9\n\t"
-                "pushq %%r10\n\t"
-                "pushq %%r11\n\t"
-                "pushq %%r12\n\t"
-                "pushq %%r13\n\t"
-                "pushq %%r14\n\t"
-                "pushq %%r15\n\t"
-                "pushfq\n\t"
-                "movq  %%rsp, %%rcx\n\t"
-                "addq  $256, %%rcx\n\t" // locate saved ebp within frame
-                "pushq %%rcx\n\t"
-                "movq %%rsp, %c1(%0)\n\t"
-                "movq  %%rax, %%rsp\n\t"
+                "movq  %%rsp, %%rax\n"
+                "movq %c1(%0), %%rsp\n"
+                "subq $512, %%rsp\n"    // frame for uthread_switch
+                "pushq $0\n"
+                "pushq $0\n"
+                "pushq $0\n"
+                "pushq $0\n"
+                "pushq $0\n"
+                "pushq %%r8\n"
+                "pushq %%r9\n"
+                "pushq %%r10\n"
+                "pushq %%r11\n"
+                "pushq %%r12\n"
+                "pushq %%r13\n"
+                "pushq %%r14\n"
+                "pushq %%r15\n"
+                "pushfq\n"
+                "movq  %%rsp, %%rcx\n"
+                "addq  $256, %%rcx\n" // locate saved ebp within frame
+                "pushq %%rcx\n"
+                "movq %%rsp, %c1(%0)\n"
+                "movq  %%rax, %%rsp\n"
 #else
 // IA32-32
 #define CLOBBERED_REGISTERS "%eax", "%ecx"
-                "movl  %%esp, %%eax\n\t"
-                "movl  %c1(%0), %%esp\n\t"
-                "subl  $512, %%esp\n\t"
-                "pushl $0\n\t"
-                "pushl $0\n\t"
-                "pushl $0\n\t"
-                "pushl $0\n\t"
-                "pushl $0\n\t"
-                "pushfl\n\t"
-                "movl  %%esp, %%ecx\n\t"
-                "addl  $256, %%ecx\n\t"
-                "pushl %%ecx\n\t"
-                "movl %%esp, %c1(%0)\n\t"
-                "movl  %%eax, %%esp\n\t"
+                "movl  %%esp, %%eax\n"
+                "movl  %c1(%0), %%esp\n"
+                "subl  $512, %%esp\n"
+                "pushl $0\n"
+                "pushl $0\n"
+                "pushl $0\n"
+                "pushl $0\n"
+                "pushl $0\n"
+                "pushfl\n"
+                "movl  %%esp, %%ecx\n"
+                "addl  $256, %%ecx\n"
+                "pushl %%ecx\n"
+                "movl %%esp, %c1(%0)\n"
+                "movl  %%eax, %%esp\n"
 #endif
                 : :
                 "r" (thread),
@@ -423,95 +424,125 @@ static uthread_t uthread_new_thread (void* (*start_proc)(void*), void* start_arg
  * uthread_switch
  */
 
-static void uthread_switch (uthread_t to_thread, int from_thread_state, void (*finish) (uthread_t, void*), void* finish_arg) {
-  struct FromContext {
-    uthread_t from_thread;
-    int       from_thread_state;
-    void    (*finish) (uthread_t, void*);
-    void*     finish_arg;
-  } from = {uthread_self(), from_thread_state, finish, finish_arg};
-  struct FromContext* fromp = &from;
-
-  assert (to_thread        != from.from_thread);
-  assert (to_thread->state != TS_RUNNING);
+static void uthread_switch (uthread_t to_thread, int from_thread_state) {
+  uthread_t from_thread = uthread_self();
   
   asm volatile (
 #if __LP64__
 // IA32-64
-                "pushq %%rbx\n\t"
-                "pushq %%rcx\n\t"
-                "pushq %%rdx\n\t"
-                "pushq %%rsi\n\t"
-                "pushq %%rdi\n\t"
-                "pushq %%r8\n\t"
-                "pushq %%r9\n\t"
-                "pushq %%r10\n\t"
-                "pushq %%r11\n\t"
-                "pushq %%r12\n\t"
-                "pushq %%r13\n\t"
-                "pushq %%r14\n\t"
-                "pushq %%r15\n\t"
-                "pushfq\n\t"
-                "pushq %%rbp\n\t"
-                "movq  %%rsp, %c4(%2)\n\t"
-                "movq  %c4(%3), %%rsp\n\t"
-                "popq  %%rbp\n\t"
-                "movq  %1, %0\n\t"
-                "popfq\n\t"
-                "popq  %%r15\n\t"
-                "popq  %%r14\n\t"
-                "popq  %%r13\n\t"            
-                "popq  %%r12\n\t"
-                "popq  %%r11\n\t"
-                "popq  %%r10\n\t"
-                "popq  %%r9\n\t"
-                "popq  %%r8\n\t"
-                "popq  %%rdi\n\t"
-                "popq  %%rsi\n\t"
-                "popq  %%rdx\n\t"
-                "popq  %%rcx\n\t"
-                "popq  %%rbx\n\t"
+                // save from_thread registers
+                "pushq %%rbx\n"
+                "pushq %%rcx\n"
+                "pushq %%rdx\n"
+                "pushq %%rsi\n"
+                "pushq %%rdi\n"
+                "pushq %%r8\n"
+                "pushq %%r9\n"
+                "pushq %%r10\n"
+                "pushq %%r11\n"
+                "pushq %%r12\n"
+                "pushq %%r13\n"
+                "pushq %%r14\n"
+                "pushq %%r15\n"
+                "pushfq\n"
+                
+                // save from_thread bp and sp
+                "pushq %%rbp\n"
+                "movq  %%rsp, %c6(%1)\n"
+                
+                // set from_thread_state
+                "mfence\n"
+                "movl  %3, %c5(%1)\n"
+                
+                // to_thread could still be running; wait for it
+                "    movl  $%c4, %%eax\n"
+                "L0: movl  %c5(%2), %%ebx\n"
+                "    cmpl  %%eax, %%ebx\n"
+                "    je    L0\n"
+                
+                // switch to to_thread
+                "movq  %c6(%2), %%rsp\n"
+                "popq  %%rbp\n"
+                
+                // set value of from_thread on new stack
+                "movq  %1, %0\n"
+                
+                // restore to_thread
+                "popfq\n"
+                "popq  %%r15\n"
+                "popq  %%r14\n"
+                "popq  %%r13\n"            
+                "popq  %%r12\n"
+                "popq  %%r11\n"
+                "popq  %%r10\n"
+                "popq  %%r9\n"
+                "popq  %%r8\n"
+                "popq  %%rdi\n"
+                "popq  %%rsi\n"
+                "popq  %%rdx\n"
+                "popq  %%rcx\n"
+                "popq  %%rbx\n"
 #else
 // IA32-32
-                "pushl %%ebx\n\t"
-                "pushl %%ecx\n\t"
-                "pushl %%edx\n\t"
-                "pushl %%esi\n\t"
-                "pushl %%edi\n\t"
-                "pushfl\n\t"
-                "pushl %%ebp\n\t"
-                "movl  %%esp, %c4(%2)\n\t"
-                "movl  %c4(%3), %%esp\n\t"
-                "popl  %%ebp\n\t"
-                "movl  %1, %0\n\t"
-                "popfl\n\t"
-                "popl  %%edi\n\t"
-                "popl  %%esi\n\t"
-                "popl  %%edx\n\t"
-                "popl  %%ecx\n\t"
-                "popl  %%ebx\n\t"
+                // save from_thread registers
+                "pushl %%ebx\n"
+                "pushl %%ecx\n"
+                "pushl %%edx\n"
+                "pushl %%esi\n"
+                "pushl %%edi\n"
+                "pushfl\n"
+
+                // save from_thread bp and sp
+                "pushl %%ebp\n"
+                "movl  %%esp, %c6(%1)\n"
+                
+                // set from_thread_state
+                "mfence\n"
+                "movl  %3, %c5(%1)\n"
+                
+                // to_thread could still be running; wait for it
+                "    movl  $%c4, %eax\n"
+                "L0: movl  %c5(%2), %%ebx\n"
+                "    cmpl  %%eax, %ebx\n"
+                "    je    L0\n"
+                
+                // switch to to_thread
+                "movl  %c6(%2), %%esp\n"
+                "popl  %%ebp\n"
+                
+                // set value of from_thread on new stack
+                "movl  %1, %0\n"
+                
+                // restore to_thread
+                "popfl\n"
+                "popl  %%edi\n"
+                "popl  %%esi\n"
+                "popl  %%edx\n"
+                "popl  %%ecx\n"
+                "popl  %%ebx\n"
 #endif
                 :
-                "=m" (fromp)
+                /* 0 */  "=m" (from_thread)
                 :
-                "r" (fromp),
-                "r" (from.from_thread),
-                "r" (to_thread),
-                "i" (offsetof (struct uthread_TCB, saved_sp)));
+                /* 1 */  "r" (from_thread),
+                /* 2 */  "r" (to_thread),
+                /* 3 */  "r" (from_thread_state),
+                /* 4 */  "i" (TS_RUNNING),
+                /* 5 */  "i" (offsetof (struct uthread_TCB, state)),
+                /* 6 */  "i" (offsetof (struct uthread_TCB, saved_sp))
+                : "%eax", "%ebx");
   
-  fromp->from_thread->state = fromp->from_thread_state;
-  if (fromp->finish)
-    fromp->finish (fromp->from_thread, fromp->finish_arg);
-  if (fromp->from_thread->state == TS_DYING) {
-    spinlock_lock (&fromp->from_thread->join_spinlock);
-    if (fromp->from_thread->joiner == (uthread_t) -1)
-      uthread_free (fromp->from_thread);
+  if (from_thread->state == TS_DYING) {
+    spinlock_lock (&from_thread->join_spinlock);
+    if (from_thread->joiner == (uthread_t) -1)
+      uthread_free (from_thread);
     else {
-      fromp->from_thread->state = TS_DEAD;
-      spinlock_unlock (&fromp->from_thread->join_spinlock);
+      from_thread->state = TS_DEAD;
+      spinlock_unlock (&from_thread->join_spinlock);
       // at this point uthread_detach could free from_thread, so don't touch it after setting it to DEAD
     }
   }
+  
   to_thread = uthread_self();
   if (to_thread->state == TS_NASCENT) {
     to_thread->state      = TS_RUNNING;
@@ -521,7 +552,7 @@ static void uthread_switch (uthread_t to_thread, int from_thread_state, void (*f
     if (to_thread->joiner != 0 && to_thread->joiner != (uthread_t) -1)
       uthread_start (to_thread->joiner);
     spinlock_unlock (&to_thread->join_spinlock);
-    uthread_stop (TS_DYING, NULL, NULL);
+    uthread_stop (TS_DYING);
   } else
     to_thread->state = TS_RUNNING;
 }
@@ -530,37 +561,21 @@ static void uthread_switch (uthread_t to_thread, int from_thread_state, void (*f
  * uthread_stop
  */
 
-static void uthread_stop (int stopping_thread_state, void (*finish) (uthread_t, void*), void* finish_arg) {
-  uthread_t to_thread;
-  int sanity = 100000;
-  while (1) {
-    assert (sanity--);
-    to_thread = ready_queue_dequeue();
-    assert (to_thread);
-    if (to_thread == uthread_self()) {
-      // yielding to self
-      assert (stopping_thread_state == TS_RUNABLE);
-      return;
-    }
-    if (to_thread->state == TS_RUNNING) {
-      // to_thread is still running; skip it
-      ready_queue_enqueue (to_thread);
-      continue;
-    } else
-      break;
-  }
-  uthread_switch (to_thread, stopping_thread_state, finish, finish_arg);
+static void uthread_stop (int stopping_thread_state) {
+  uthread_t to_thread = ready_queue_dequeue();
+  assert (to_thread);
+  uthread_switch (to_thread, stopping_thread_state);
 }
 
 /**
  * uthread_start
+ *    Note that start does not set thread->state to TS_RUNNABLE because the thread might
+ *    still be running.  Thread switch will wait for it to stop before re-starting it.
+ *    But, as a consequence, it is possible to have a thread on the ready queue that is
+ *    runnable but thread->state == TS_BLOCKED.  This is okay.
  */
 
 static void uthread_start (uthread_t thread) {
-  long int sanity = 100000;
-  while (thread->state == TS_RUNNING)
-    assert (sanity--);
-  thread->state = TS_RUNABLE;
   ready_queue_enqueue (thread);
 }
 
@@ -603,8 +618,9 @@ uthread_t uthread_self() {
     for (i=0; i<num_pthreads; i++)
       if ((uintptr_t)&dummy_local >= pthread_base_sp_lower_bound[i] && (uintptr_t) &dummy_local <= pthread_base_sp_upper_bound[i])
         return pthread_base_threads[i];
-#endif
+#else
     return *(uthread_t*) (void*) (((uintptr_t) &dummy_local) & ~(STACK_SIZE-1));
+#endif
   }
 }
 
@@ -612,30 +628,23 @@ uthread_t uthread_self() {
  * uthead_yield
  */
 
-static void uthread_enqueue_ready_queue (uthread_t thread, void* arg) {
-  ready_queue_enqueue (thread);
-}
-
 void uthread_yield() {
-  uthread_stop (TS_RUNABLE, uthread_enqueue_ready_queue, NULL);
+  ready_queue_enqueue (uthread_self());
+  uthread_stop        (TS_RUNABLE);
 }
 
 /**
  * uthread_join
  */
 
-static void uthread_join_add_joiner (uthread_t joiner, void* threadv) {
-  uthread_t thread = threadv;
-  thread->joiner = joiner;
-  spinlock_unlock (&thread->join_spinlock);
-}
-
 int uthread_join (uthread_t thread, void** value_ptr) {
   if (thread->joiner == 0) {
     spinlock_lock (&thread->join_spinlock);
     if (thread->state != TS_DYING && thread->state != TS_DEAD) {
-      uthread_stop (TS_BLOCKED, uthread_join_add_joiner, thread);
-      spinlock_lock (&thread->join_spinlock);
+      thread->joiner = uthread_self();
+      spinlock_unlock (&thread->join_spinlock);
+      uthread_stop    (TS_BLOCKED);
+      spinlock_lock   (&thread->join_spinlock);
     }
     if (value_ptr)
       *value_ptr = thread->return_val;
@@ -682,14 +691,16 @@ void uthread_setInterrupt (int isInterrupt) {
 int uthread_isInterrupt () {
   return ! init_complete || uthread_self() ->isInterrupt;
 }
+#else
+void uthread_setInterrupt (int isInterrupt) {}
 #endif
 
 /**
  * uthread_block
  */
 
-void uthread_block (void (*finish) (uthread_t, void*), void* finish_arg) {
-  uthread_stop (TS_BLOCKED, finish, finish_arg);
+void uthread_block () {
+  uthread_stop (TS_BLOCKED);
 }
 
 /**
@@ -697,9 +708,5 @@ void uthread_block (void (*finish) (uthread_t, void*), void* finish_arg) {
  */
 
 void uthread_unblock (uthread_t thread) {
-  int sanity = 100000;
-  while (thread->state == TS_RUNNING)
-    assert (sanity--);
-  assert (thread->state == TS_BLOCKED);
   uthread_start (thread);
 }

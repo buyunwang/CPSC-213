@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <assert.h>
+#include "spinlock.h"
 #include "uthread.h"
 #include "uthread_util.h"
 #include "uthread_mutex_cond.h"
@@ -53,16 +54,12 @@ void uthread_mutex_destroy (uthread_mutex_t mutex) {
  * uthread_mutex_lock
  */
 
-static void uthread_mutex_enqueue (uthread_t thread, void* mutexv) {
-  uthread_mutex_t mutex = mutexv;
-  uthread_enqueue  (&mutex->waiter_queue, thread);
-  spinlock_unlock (&mutex->spinlock);
-}
-
 void uthread_mutex_lock (uthread_mutex_t mutex) {
   spinlock_lock (&mutex->spinlock);
   while (mutex->holder || mutex->reader_count > 0) {
-    uthread_block (uthread_mutex_enqueue, mutex);
+    uthread_enqueue (&mutex->waiter_queue, uthread_self());
+    spinlock_unlock (&mutex->spinlock);
+    uthread_block();
     spinlock_lock (&mutex->spinlock);
   }
   mutex->holder = uthread_self();
@@ -73,16 +70,12 @@ void uthread_mutex_lock (uthread_mutex_t mutex) {
  * uthread_mutex_lock_readonly
  */
 
-static void uthread_mutex_enqueue_readonly (uthread_t thread, void* mutexv) {
-  uthread_mutex_t mutex = mutexv;
-  uthread_enqueue (&mutex->reader_waiter_queue, thread);
-  spinlock_unlock (&mutex->spinlock);
-}
-
 void uthread_mutex_lock_readonly (uthread_mutex_t mutex) {
   spinlock_lock (&mutex->spinlock);
   while (mutex->holder || !uthread_queue_is_empty (&mutex->waiter_queue)) {
-    uthread_block   (uthread_mutex_enqueue_readonly, mutex);
+    uthread_enqueue (&mutex->reader_waiter_queue, uthread_self());
+    spinlock_unlock (&mutex->spinlock);
+    uthread_block();
     spinlock_lock   (&mutex->spinlock);
   }
   mutex->reader_count += 1;
@@ -93,12 +86,12 @@ void uthread_mutex_lock_readonly (uthread_mutex_t mutex) {
  * uthread_mutex_unlock
  */
 
-static void uthread_mutex_unlock_for_thread (uthread_mutex_t mutex, uthread_t thread) {
+void uthread_mutex_unlock (uthread_mutex_t mutex) {
   uthread_t waiter_thread;
   
   spinlock_lock (&mutex->spinlock);
   if (mutex->holder) {
-    assert (mutex->holder == thread);
+    assert (mutex->holder == uthread_self());
     mutex->holder = 0;
   } else {
     assert (mutex->reader_count > 0);
@@ -114,10 +107,6 @@ static void uthread_mutex_unlock_for_thread (uthread_mutex_t mutex, uthread_t th
     }
   }
   spinlock_unlock (&mutex->spinlock);
-}
-
-void uthread_mutex_unlock (uthread_mutex_t mutex) {
-  uthread_mutex_unlock_for_thread (mutex, uthread_self());
 }
 
 /**
@@ -143,15 +132,11 @@ void uthread_cond_destroy (uthread_cond_t cond) {
  * uthread_cond_wait
  */
 
-static void uthread_cond_enqueue (uthread_t thread, void* condv) {
-  uthread_cond_t cond = condv;
-  uthread_enqueue (&cond->waiter_queue, thread);
-  uthread_mutex_unlock_for_thread (cond->mutex, thread);
-}
-
 void uthread_cond_wait (uthread_cond_t cond) {
-  assert             (cond->mutex->holder == uthread_self ());
-  uthread_block      (uthread_cond_enqueue, cond);
+  assert (cond->mutex->holder == uthread_self ());
+  uthread_enqueue (&cond->waiter_queue, uthread_self());
+  uthread_mutex_unlock (cond->mutex);
+  uthread_block();
   uthread_mutex_lock (cond->mutex);
 }
 
